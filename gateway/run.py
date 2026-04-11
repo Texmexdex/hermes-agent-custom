@@ -288,6 +288,12 @@ logger = logging.getLogger(__name__)
 # between the guard check and actual agent creation.
 _AGENT_PENDING_SENTINEL = object()
 
+# Maximum consecutive non-retryable failures per session before the
+# gateway stops recreating agents.  Prevents CPU-burning MCP restart
+# loops when a persistent config error (e.g. invalid model ID → 400)
+# causes agents to fail immediately on every attempt.  See #7130.
+_MAX_CONSECUTIVE_FAILURES = 3
+
 
 def _resolve_runtime_agent_kwargs() -> dict:
     """Resolve provider credentials for gateway-created AIAgent instances."""
@@ -529,6 +535,13 @@ class GatewayRunner:
         # Track pending /update prompt responses per session.
         # Key: session_key, Value: True when a prompt is waiting for user input.
         self._update_prompt_pending: Dict[str, bool] = {}
+
+        # Consecutive non-retryable failure tracker per session.
+        # Prevents CPU-burning restart loops when a persistent config
+        # error (e.g. invalid model ID → 400) causes agents to be
+        # recreated and fail immediately on every attempt.
+        # Key: session_key, Value: int (consecutive failure count)
+        self._session_consecutive_failures: Dict[str, int] = {}
 
         # Persistent Honcho managers keyed by gateway session key.
         # This preserves write_frequency="session" semantics across short-lived
@@ -3016,6 +3029,29 @@ class GatewayRunner:
                 except Exception as exc:
                     logger.debug("@ context reference expansion failed: %s", exc)
 
+            # Circuit breaker: if this session has hit N consecutive
+            # non-retryable failures, don't recreate the agent — it will
+            # just fail again, burning CPU on MCP reinit.  See #7130.
+            _fail_count = getattr(self, "_session_consecutive_failures", {}).get(session_key, 0)
+            if _fail_count >= _MAX_CONSECUTIVE_FAILURES:
+                logger.warning(
+                    "Circuit breaker: session %s blocked after %d consecutive "
+                    "failures. Use /reset to clear.",
+                    session_key, _fail_count,
+                )
+                _adapter = self.adapters.get(source.platform)
+                if _adapter:
+                    await _adapter.send(
+                        source.chat_id,
+                        f"⚠️ This session has failed {_fail_count} times in a row "
+                        f"with a non-retryable error (likely a config issue like an "
+                        f"invalid model ID).\n\n"
+                        f"Use /reset to start a new session, or check your model "
+                        f"configuration with /model.",
+                        metadata={"thread_id": source.thread_id} if source.thread_id else None,
+                    )
+                return
+
             # Run the agent
             agent_result = await self._run_agent(
                 message=message_text,
@@ -3073,6 +3109,29 @@ class GatewayRunner:
                         f"The request failed: {str(error_detail)[:300]}\n"
                         "Try again or use /reset to start a fresh session."
                     )
+
+            # Track consecutive failures for circuit breaker (#7130).
+            _failures = getattr(self, "_session_consecutive_failures", None)
+            if _failures is not None:
+                if agent_result.get("failed"):
+                    _failures[session_key] = _failures.get(session_key, 0) + 1
+                    _new_count = _failures[session_key]
+                    logger.warning(
+                        "Session %s: consecutive failure %d/%d (error: %s)",
+                        session_key, _new_count, _MAX_CONSECUTIVE_FAILURES,
+                        str(agent_result.get("error", ""))[:200],
+                    )
+                    if _new_count >= _MAX_CONSECUTIVE_FAILURES:
+                        # Evict the cached agent to prevent stale state
+                        self._evict_cached_agent(session_key)
+                        logger.warning(
+                            "Session %s: circuit breaker engaged after %d "
+                            "consecutive failures. Evicted cached agent.",
+                            session_key, _new_count,
+                        )
+                else:
+                    # Success — reset the counter
+                    _failures.pop(session_key, None)
 
             # If the agent's session_id changed during compression, update
             # session_entry so transcript writes below go to the right session.
@@ -3392,6 +3451,11 @@ class GatewayRunner:
                 except Exception:
                     pass
         self._evict_cached_agent(session_key)
+
+        # Clear circuit breaker on reset so the user can try again
+        _failures = getattr(self, "_session_consecutive_failures", None)
+        if _failures is not None:
+            _failures.pop(session_key, None)
 
         try:
             from tools.env_passthrough import clear_env_passthrough
