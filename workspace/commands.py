@@ -122,8 +122,15 @@ def _handle_index(args: Namespace, human: bool) -> None:
         print(f"\nIndexed {summary.files_indexed} files "
               f"({summary.chunks_created} chunks), "
               f"skipped {summary.files_skipped}, "
+              f"errored {summary.files_errored}, "
               f"pruned {summary.files_pruned} stale. "
               f"Took {summary.duration_seconds:.1f}s.")
+        if summary.errors:
+            print("\nErrors:")
+            for err in summary.errors:
+                print(f"  [{err.stage}] {err.path}: {err.message}")
+            if summary.errors_truncated:
+                print(f"  ... and {summary.files_errored - len(summary.errors)} more")
     else:
         print(json.dumps(summary.to_dict(), indent=2))
 
@@ -135,7 +142,8 @@ def _handle_search(args: Namespace, human: bool) -> None:
     config = load_workspace_config()
     query = args.query
     limit = getattr(args, "limit", None)
-    path_prefix = getattr(args, "path", None)
+    raw_path = getattr(args, "path", None)
+    path_prefix = str(Path(raw_path).resolve()) if raw_path else None
     file_glob = getattr(args, "glob", None)
 
     results = search_workspace(

@@ -6,6 +6,7 @@ and BM25 full-text search.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -43,8 +44,8 @@ CREATE TABLE IF NOT EXISTS chunks (
     token_count INTEGER NOT NULL,
     start_line  INTEGER NOT NULL,
     end_line    INTEGER NOT NULL,
-    start_byte  INTEGER NOT NULL,
-    end_byte    INTEGER NOT NULL,
+    start_char  INTEGER NOT NULL,
+    end_char    INTEGER NOT NULL,
     section     TEXT,
     kind        TEXT NOT NULL,
     UNIQUE(abs_path, chunk_index)
@@ -162,14 +163,14 @@ class SQLiteFTS5Store:
     def insert_chunks(self, chunks: list[ChunkRecord]) -> None:
         self.conn.executemany(
             """INSERT INTO chunks (chunk_id, abs_path, chunk_index, content,
-                    token_count, start_line, end_line, start_byte, end_byte,
+                    token_count, start_line, end_line, start_char, end_char,
                     section, kind)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             [
                 (
                     c.chunk_id, c.abs_path, c.chunk_index, c.content,
                     c.token_count, c.start_line, c.end_line,
-                    c.start_byte, c.end_byte, c.section, c.kind,
+                    c.start_char, c.end_char, c.section, c.kind,
                 )
                 for c in chunks
             ],
@@ -186,6 +187,8 @@ class SQLiteFTS5Store:
         path_prefix: str | None = None,
         file_glob: str | None = None,
     ) -> list[SearchResult]:
+        limit = max(1, limit)
+
         if not query.strip():
             return []
 
@@ -257,17 +260,33 @@ class SQLiteFTS5Store:
         self.conn.commit()
 
 
-def _build_fts_query(raw_query: str) -> str:
-    """Build an FTS5 query from raw user input.
+_FTS5_COMPOUND_SEPARATORS = re.compile(r"[-_]")
 
-    Extracts alphanumeric tokens of length >= 2 and joins them with OR
-    for broad matching.  Porter stemmer handles morphological variants.
+
+def _build_fts_query(raw_query: str) -> str:
+    """Build a safe FTS5 query from raw user input.
+
+    All tokens are double-quoted to prevent FTS5 operator injection.
+    Compound terms (hyphenated/underscored) get phrase + AND boost.
     """
-    tokens = []
-    for word in raw_query.split():
-        cleaned = "".join(c for c in word if c.isalnum())
-        if len(cleaned) >= 2:
-            tokens.append(cleaned)
+    tokens = re.findall(r"[^\W_]+", raw_query, re.UNICODE)
+    tokens = [t.lower() for t in tokens if len(t) >= 2]
     if not tokens:
         return ""
-    return " OR ".join(tokens)
+
+    words = raw_query.split()
+    parts: list[str] = []
+    for word in words:
+        sub_tokens = re.findall(r"[^\W_]+", word, re.UNICODE)
+        sub_tokens = [t.lower() for t in sub_tokens if len(t) >= 2]
+        if not sub_tokens:
+            continue
+        if len(sub_tokens) > 1 and _FTS5_COMPOUND_SEPARATORS.search(word):
+            phrase = " ".join(sub_tokens)
+            and_clause = " AND ".join(f'"{t}"' for t in sub_tokens)
+            parts.append(f'("{phrase}" OR ({and_clause}))')
+        else:
+            for t in sub_tokens:
+                parts.append(f'"{t}"')
+
+    return " OR ".join(parts)

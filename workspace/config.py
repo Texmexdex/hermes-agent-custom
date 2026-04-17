@@ -55,15 +55,35 @@ class KnowledgebaseConfig:
         ch = merged.get("chunking", {})
         ix = merged.get("indexing", {})
         sr = merged.get("search", {})
+
+        chunk_size = ch.get("chunk_size", 512)
+        overlap = ch.get("overlap", 80)
+        threshold = ch.get("threshold", 16_000)
+        max_file_mb = ix.get("max_file_mb", 10)
+        default_limit = sr.get("default_limit", 20)
+
+        if chunk_size <= 0:
+            raise ValueError(f"knowledgebase.chunking.chunk_size must be > 0, got {chunk_size}")
+        if overlap < 0 or overlap >= chunk_size:
+            raise ValueError(
+                f"knowledgebase.chunking.overlap must be >= 0 and < chunk_size ({chunk_size}), got {overlap}"
+            )
+        if threshold < 0:
+            raise ValueError(f"knowledgebase.chunking.threshold must be >= 0, got {threshold}")
+        if max_file_mb <= 0:
+            raise ValueError(f"knowledgebase.indexing.max_file_mb must be > 0, got {max_file_mb}")
+        if default_limit < 1:
+            raise ValueError(f"knowledgebase.search.default_limit must be >= 1, got {default_limit}")
+
         return cls(
             roots=roots,
             chunking=ChunkingConfig(
-                chunk_size=ch.get("chunk_size", 512),
-                overlap=ch.get("overlap", 80),
-                threshold=ch.get("threshold", 16_000),
+                chunk_size=chunk_size,
+                overlap=overlap,
+                threshold=threshold,
             ),
-            indexing=IndexingConfig(max_file_mb=ix.get("max_file_mb", 10)),
-            search=SearchConfig(default_limit=sr.get("default_limit", 20)),
+            indexing=IndexingConfig(max_file_mb=max_file_mb),
+            search=SearchConfig(default_limit=default_limit),
         )
 
 

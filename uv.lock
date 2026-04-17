@@ -1789,6 +1789,7 @@ version = "0.10.0"
 source = { editable = "." }
 dependencies = [
     { name = "anthropic" },
+    { name = "charset-normalizer" },
     { name = "edge-tts" },
     { name = "exa-py" },
     { name = "fal-client" },
@@ -1958,6 +1959,7 @@ requires-dist = [
     { name = "asyncpg", marker = "extra == 'matrix'", specifier = ">=0.29" },
     { name = "atroposlib", marker = "extra == 'rl'", git = "https://github.com/NousResearch/atropos.git?rev=c20c85256e5a45ad31edf8b7276e9c5ee1995a30" },
     { name = "boto3", marker = "extra == 'bedrock'", specifier = ">=1.35.0,<2" },
+    { name = "charset-normalizer", specifier = ">=3.3.0,<4" },
     { name = "chonkie", extras = ["code"], marker = "extra == 'workspace'", specifier = ">=1.6.0,<2" },
     { name = "croniter", marker = "extra == 'cron'", specifier = ">=6.0.0,<7" },
     { name = "daytona", marker = "extra == 'daytona'", specifier = ">=0.148.0,<1" },

@@ -19,6 +19,13 @@ Usage:
     hermes cron status         # Check if cron scheduler is running
     hermes doctor              # Check configuration and dependencies
     hermes honcho setup                    # Configure Honcho AI memory integration
+    hermes workspace roots list/add/remove  # Manage workspace root directories
+    hermes workspace index                   # Index workspace files
+    hermes workspace search <query>            # Search indexed content
+    hermes workspace search <query> --path <prefix>  # Search with path filter
+    hermes workspace search <query> --glob <pattern>  # Search with glob pattern
+    hermes workspace search <query> --limit <n>      # Limit number of results
+    hermes workspace search <query> --human         # Human-readable output format
     hermes honcho status                   # Show Honcho config and connection status
     hermes honcho sessions                 # List directory → session name mappings
     hermes honcho map <name>               # Map current directory to a session name
@@ -6388,7 +6395,7 @@ Examples:
     workspace_parser.add_argument("--human", action="store_true", help="Human-readable Rich output instead of JSON")
 
     def cmd_workspace(args):
-        from hermes_cli.workspace_commands import workspace_command
+        from workspace.commands import workspace_command
         workspace_command(args)
 
     workspace_parser.set_defaults(func=cmd_workspace)

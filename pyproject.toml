@@ -36,6 +36,8 @@ dependencies = [
   "PyJWT[crypto]>=2.12.0,<3",  # CVE-2026-32597
   # Workspace .hermesignore parsing (gitignore-style patterns)
   "pathspec>=0.12.0,<1",
+  # Workspace encoding detection for non-UTF8 files
+  "charset-normalizer>=3.3.0,<4",
 ]
 
 [project.optional-dependencies]

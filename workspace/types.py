@@ -37,8 +37,8 @@ class ChunkRecord:
     token_count: int
     start_line: int
     end_line: int
-    start_byte: int
-    end_byte: int
+    start_char: int
+    end_char: int
     section: str | None = None
     kind: str = "text"
 
@@ -70,18 +70,40 @@ class SearchResult:
 
 
 @dataclass(frozen=True)
+class IndexError:
+    path: str
+    stage: str
+    error_type: str
+    message: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "path": self.path,
+            "stage": self.stage,
+            "error_type": self.error_type,
+            "message": self.message,
+        }
+
+
+@dataclass(frozen=True)
 class IndexSummary:
     files_indexed: int
     files_skipped: int
     files_pruned: int
+    files_errored: int
     chunks_created: int
     duration_seconds: float
+    errors: list[IndexError]
+    errors_truncated: bool
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "files_indexed": self.files_indexed,
             "files_skipped": self.files_skipped,
             "files_pruned": self.files_pruned,
+            "files_errored": self.files_errored,
             "chunks_created": self.chunks_created,
             "duration_seconds": round(self.duration_seconds, 2),
+            "errors": [e.to_dict() for e in self.errors],
+            "errors_truncated": self.errors_truncated,
         }

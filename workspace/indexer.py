@@ -18,9 +18,9 @@ from typing import Any, Callable
 
 from workspace.config import WorkspaceConfig
 from workspace.constants import CODE_SUFFIXES, MARKDOWN_SUFFIXES, WORKSPACE_SUBDIRS, get_index_dir
-from workspace.files import iter_workspace_files
+from workspace.files import iter_workspace_files, seed_hermesignore
 from workspace.store import SQLiteFTS5Store
-from workspace.types import ChunkRecord, FileRecord, IndexSummary
+from workspace.types import ChunkRecord, FileRecord, IndexError, IndexSummary
 
 log = logging.getLogger(__name__)
 
@@ -39,6 +39,9 @@ def _require_chonkie() -> None:
         )
 
 
+_MAX_ERRORS = 50
+
+
 def index_workspace(
     config: WorkspaceConfig,
     *,
@@ -52,7 +55,9 @@ def index_workspace(
 
     files_indexed = 0
     files_skipped = 0
+    files_errored = 0
     chunks_created = 0
+    errors: list[IndexError] = []
 
     all_files = list(iter_workspace_files(config))
     total = len(all_files)
@@ -68,50 +73,65 @@ def index_workspace(
             if progress:
                 progress(i + 1, total, abs_path)
 
-            content_hash = _file_hash(file_path)
-            existing = store.get_file_record(abs_path)
-            if (
-                existing
-                and existing.content_hash == content_hash
-                and existing.config_signature == config_sig
-            ):
-                files_skipped += 1
-                continue
-
             try:
-                text = file_path.read_text(encoding="utf-8", errors="replace")
-            except Exception:
-                log.warning("Failed to read %s", file_path, exc_info=True)
-                files_skipped += 1
+                content_hash = _file_hash(file_path)
+                existing = store.get_file_record(abs_path)
+                if (
+                    existing
+                    and existing.content_hash == content_hash
+                    and existing.config_signature == config_sig
+                ):
+                    files_skipped += 1
+                    continue
+
+                text = _read_file_text(file_path)
+                if text is None:
+                    files_errored += 1
+                    _append_error(errors, IndexError(
+                        path=abs_path, stage="read",
+                        error_type="EncodingError",
+                        message="Could not decode file with sufficient confidence",
+                    ))
+                    continue
+
+                if not text.strip():
+                    files_skipped += 1
+                    continue
+
+                store.delete_chunks_for_file(abs_path)
+
+                chunks = _chunk_file(file_path, text, config, chunkers)
+                chunk_records = _to_chunk_records(abs_path, text, chunks, file_path.suffix.lower())
+
+                stat = file_path.stat()
+                record = FileRecord(
+                    abs_path=abs_path,
+                    root_path=root_path,
+                    content_hash=content_hash,
+                    config_signature=config_sig,
+                    size_bytes=stat.st_size,
+                    modified_at=datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+                    indexed_at=datetime.now(tz=timezone.utc).isoformat(),
+                    chunk_count=len(chunk_records),
+                )
+                store.upsert_file(record)
+                if chunk_records:
+                    store.insert_chunks(chunk_records)
+                store.commit()
+
+                files_indexed += 1
+                chunks_created += len(chunk_records)
+
+            except Exception as exc:
+                files_errored += 1
+                stage = "discover" if isinstance(exc, FileNotFoundError) else "store"
+                _append_error(errors, IndexError(
+                    path=abs_path, stage=stage,
+                    error_type=type(exc).__name__,
+                    message=str(exc),
+                ))
+                log.warning("Failed to index %s: %s", abs_path, exc, exc_info=True)
                 continue
-
-            if not text.strip():
-                files_skipped += 1
-                continue
-
-            store.delete_chunks_for_file(abs_path)
-
-            chunks = _chunk_file(file_path, text, config, chunkers)
-            chunk_records = _to_chunk_records(abs_path, text, chunks, file_path.suffix.lower())
-
-            stat = file_path.stat()
-            record = FileRecord(
-                abs_path=abs_path,
-                root_path=root_path,
-                content_hash=content_hash,
-                config_signature=config_sig,
-                size_bytes=stat.st_size,
-                modified_at=datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
-                indexed_at=datetime.now(tz=timezone.utc).isoformat(),
-                chunk_count=len(chunk_records),
-            )
-            store.upsert_file(record)
-            if chunk_records:
-                store.insert_chunks(chunk_records)
-            store.commit()
-
-            files_indexed += 1
-            chunks_created += len(chunk_records)
 
         pruned = _prune_stale(store, disk_paths)
         store.commit()
@@ -121,9 +141,36 @@ def index_workspace(
         files_indexed=files_indexed,
         files_skipped=files_skipped,
         files_pruned=pruned,
+        files_errored=files_errored,
         chunks_created=chunks_created,
         duration_seconds=elapsed,
+        errors=errors,
+        errors_truncated=files_errored > _MAX_ERRORS,
     )
+
+
+def _append_error(errors: list[IndexError], error: IndexError) -> None:
+    if len(errors) < _MAX_ERRORS:
+        errors.append(error)
+
+
+def _read_file_text(path: Path) -> str | None:
+    raw = path.read_bytes()
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    try:
+        from charset_normalizer import from_bytes
+        result = from_bytes(raw).best()
+        if result is None or result.encoding is None:
+            return None
+        if result.coherence < 0.5:
+            return None
+        return str(result)
+    except ImportError:
+        log.debug("charset-normalizer not installed, skipping non-UTF8 file: %s", path)
+        return None
 
 
 def ensure_workspace_dirs(config: WorkspaceConfig) -> None:
@@ -132,6 +179,7 @@ def ensure_workspace_dirs(config: WorkspaceConfig) -> None:
     for sub in WORKSPACE_SUBDIRS:
         (root / sub).mkdir(exist_ok=True)
     get_index_dir(root).mkdir(parents=True, exist_ok=True)
+    seed_hermesignore(root)
 
 
 class _ChunkerCache:
@@ -152,6 +200,7 @@ class _ChunkerCache:
                 "markdown",
                 tokenizer="word",
                 chunk_size=ch.chunk_size,
+                chunk_overlap=ch.overlap,
             )
         return self._markdown
 
@@ -163,6 +212,7 @@ class _ChunkerCache:
             self._code = CodeChunker(
                 tokenizer="word",
                 chunk_size=ch.chunk_size,
+                chunk_overlap=ch.overlap,
                 language="auto",
             )
         return self._code
@@ -175,6 +225,7 @@ class _ChunkerCache:
             self._default = RecursiveChunker(
                 tokenizer="word",
                 chunk_size=ch.chunk_size,
+                chunk_overlap=ch.overlap,
             )
         return self._default
 
@@ -190,7 +241,11 @@ def _chunk_file(
 
     suffix = path.suffix.lower()
     if suffix in MARKDOWN_SUFFIXES:
-        return chunkers.markdown(text)
+        try:
+            return chunkers.markdown(text)
+        except Exception:
+            log.debug("Markdown chunker failed for %s, falling back to default", path)
+            return chunkers.default(text)
     elif suffix in CODE_SUFFIXES:
         try:
             return chunkers.code(text)
@@ -205,7 +260,7 @@ def _to_chunk_records(
     abs_path: str, full_text: str, chunks: list[Any], suffix: str,
 ) -> list[ChunkRecord]:
     if not chunks:
-        total_lines = full_text.count("\n") + 1
+        total_lines = len(full_text.splitlines())
         word_count = len(full_text.split())
         section = _extract_first_heading(full_text) if suffix in MARKDOWN_SUFFIXES else None
         kind = _kind_from_suffix(suffix)
@@ -218,8 +273,8 @@ def _to_chunk_records(
                 token_count=word_count,
                 start_line=1,
                 end_line=total_lines,
-                start_byte=0,
-                end_byte=len(full_text.encode("utf-8")),
+                start_char=0,
+                end_char=len(full_text),
                 section=section,
                 kind=kind,
             )
@@ -230,10 +285,10 @@ def _to_chunk_records(
     records = []
 
     for i, chunk in enumerate(chunks):
-        start_byte = chunk.start_index
-        end_byte = chunk.end_index
-        start_line = _byte_to_line(line_offsets, start_byte)
-        end_line = _byte_to_line(line_offsets, max(0, end_byte - 1))
+        start_char = chunk.start_index
+        end_char = chunk.end_index
+        start_line = _offset_to_line(line_offsets, start_char)
+        end_line = _offset_to_line(line_offsets, max(0, end_char - 1))
         section = _extract_first_heading(chunk.text) if suffix in MARKDOWN_SUFFIXES else None
 
         records.append(
@@ -245,8 +300,8 @@ def _to_chunk_records(
                 token_count=chunk.token_count,
                 start_line=start_line,
                 end_line=end_line,
-                start_byte=start_byte,
-                end_byte=end_byte,
+                start_char=start_char,
+                end_char=end_char,
                 section=section,
                 kind=kind,
             )
@@ -263,7 +318,7 @@ def _build_line_offsets(text: str) -> list[int]:
     return offsets
 
 
-def _byte_to_line(offsets: list[int], char_offset: int) -> int:
+def _offset_to_line(offsets: list[int], char_offset: int) -> int:
     """Convert a character offset to a 1-based line number."""
     lo, hi = 0, len(offsets) - 1
     while lo < hi:

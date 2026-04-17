@@ -58,6 +58,53 @@ KNOWLEDGEBASE_CONFIG_DEFAULTS = {
 INDEX_DIR_NAME = ".index"
 INDEX_DB_NAME = "workspace.sqlite"
 HERMESIGNORE_NAME = ".hermesignore"
+GITIGNORE_NAME = ".gitignore"
+
+DEFAULT_IGNORE_PATTERNS = """\
+# Version control
+.git/
+.svn/
+.hg/
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.tox/
+.venv/
+venv/
+.env/
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# JavaScript / Node
+node_modules/
+bower_components/
+.npm/
+.yarn/
+
+# Build outputs
+target/
+out/
+_build/
+
+# Hermes internals
+.index/
+"""
 
 
 def get_workspace_root(hermes_home: Path, workspace_path: str = "") -> Path:
