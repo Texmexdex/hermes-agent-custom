@@ -5,6 +5,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { setInputSelection } from '../app/inputSelectionStore.js'
 import { readClipboardText, writeClipboardText } from '../lib/clipboard.js'
 import { cursorLayout } from '../lib/inputMetrics.js'
+import { ensureSafeAnsi } from '../lib/ansiSafeguard.js'
 import { isActionMod, isMac, isMacActionFallback } from '../lib/platform.js'
 
 type InkExt = typeof Ink & {
@@ -229,6 +230,7 @@ function renderWithCursor(value: string, cursor: number) {
 
   for (const { segment, index } of seg().segment(value)) {
     if (!done && index >= pos) {
+      // Add invert formatting with explicit reset to prevent ANSI leakage
       out += invert(index === pos && segment !== '\n' ? segment : ' ')
       done = true
 
@@ -240,7 +242,10 @@ function renderWithCursor(value: string, cursor: number) {
     out += segment
   }
 
-  return done ? out : out + invert(' ')
+  const result = done ? out : out + invert(' ')
+  
+  // Ensure we always have a reset at the end to prevent ANSI leakage during scrolling
+  return result + (result.endsWith(INV_OFF) ? '' : INV_OFF)
 }
 
 function renderWithSelection(value: string, start: number, end: number) {
@@ -248,7 +253,11 @@ function renderWithSelection(value: string, start: number, end: number) {
     return value
   }
 
-  return value.slice(0, start) + invert(value.slice(start, end) || ' ') + value.slice(end)
+  // Make sure we add explicit reset codes to prevent ANSI leakage
+  const result = value.slice(0, start) + invert(value.slice(start, end) || ' ') + value.slice(end)
+  
+  // Ensure we always have a reset at the end to prevent ANSI leakage during scrolling
+  return result + (result.endsWith(INV_OFF) ? '' : INV_OFF)
 }
 
 function useFwdDelete(active: boolean) {
@@ -339,19 +348,23 @@ export function TextInput({
   const nativeCursor = focus && termFocus && !selected && !!stdout?.isTTY
 
   const rendered = useMemo(() => {
+    let result = '';
+    
     if (!focus) {
-      return display || dim(placeholder)
+      result = display || dim(placeholder);
     }
-
-    if (!display && placeholder) {
-      return nativeCursor ? dim(placeholder) : invert(placeholder[0] ?? ' ') + dim(placeholder.slice(1))
+    else if (!display && placeholder) {
+      result = nativeCursor ? dim(placeholder) : invert(placeholder[0] ?? ' ') + dim(placeholder.slice(1));
     }
-
-    if (selected) {
-      return renderWithSelection(display, selected.start, selected.end)
+    else if (selected) {
+      result = renderWithSelection(display, selected.start, selected.end);
     }
-
-    return nativeCursor ? display || ' ' : renderWithCursor(display, cur)
+    else {
+      result = nativeCursor ? display || ' ' : renderWithCursor(display, cur);
+    }
+    
+    // Final safety check to ensure no ANSI escape codes are leaked
+    return ensureSafeAnsi(result);
   }, [cur, display, focus, nativeCursor, placeholder, selected])
 
   useEffect(() => {
@@ -888,19 +901,57 @@ export function TextInput({
           return
         }
 
-        clearSel()
+        if (selRef.current) {
+          // If there's an existing selection and user is clicking
+          // without modifier keys, clear it and move cursor
+          selRef.current = null
+          setSel(null)
+        }
+        
         const next = offsetFromPosition(display, e.localRow ?? 0, e.localCol ?? 0, columns)
         setCur(next)
         curRef.current = next
       }}
-      onMouseDown={(e: { button: number }) => {
-        // Right-click to paste: route through the same hotkey path as
-        // Alt+V so the composer's clipboard RPC (text or image) handles it.
-        if (!focus || e.button !== 2) {
+      onDrag={(e: { localRow?: number; localCol?: number }) => {
+        // Handle text selection during mouse drag
+        if (!focus) {
           return
         }
 
-        emitPaste({ cursor: curRef.current, hotkey: true, text: '', value: vRef.current })
+        const currentPos = offsetFromPosition(display, e.localRow ?? 0, e.localCol ?? 0, columns)
+        
+        // Create or update selection
+        const selStart = curRef.current
+        const selEnd = currentPos
+        
+        if (selStart !== selEnd) {
+          const nextSel = { start: selStart, end: selEnd }
+          selRef.current = nextSel
+          setSel(nextSel)
+        }
+      }}
+      onMouseDown={(e: { button: number; localRow?: number; localCol?: number }) => {
+        // Right-click to paste: route through the same hotkey path as
+        // Alt+V so the composer's clipboard RPC (text or image) handles it.
+        if (!focus) {
+          return
+        }
+        
+        if (e.button === 2) {
+          // Right-click paste handling
+          emitPaste({ cursor: curRef.current, hotkey: true, text: '', value: vRef.current })
+        } else if (e.button === 0) {
+          // Left-click: Start potential selection by setting the cursor position
+          const clickPos = offsetFromPosition(display, e.localRow ?? 0, e.localCol ?? 0, columns)
+          setCur(clickPos)
+          curRef.current = clickPos
+          
+          // Clear any existing selection
+          if (selRef.current) {
+            selRef.current = null
+            setSel(null)
+          }
+        }
       }}
       ref={boxRef}
     >
