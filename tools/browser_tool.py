@@ -1024,16 +1024,23 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_click",
-        "description": "Click on an element identified by its ref ID from the snapshot (e.g., '@e5'). The ref IDs are shown in square brackets in the snapshot output. Requires browser_navigate and browser_snapshot to be called first.",
+        "description": "Click on an element identified by its ref ID from the snapshot (e.g., '@e5'). The ref IDs are shown in square brackets in the snapshot output. Requires browser_navigate and browser_snapshot to be called first.\n\nAlternatively, click at exact viewport coordinates (x, y) using compositor-level input. This bypasses DOM selectors entirely — clicks pass through iframes, shadow DOM, cross-origin boundaries, and canvas elements. Use browser_vision with annotate=true to find coordinates, or browser_console to evaluate getBoundingClientRect(). Provide EITHER ref OR (x + y), not both.",
         "parameters": {
             "type": "object",
             "properties": {
                 "ref": {
                     "type": "string",
                     "description": "The element reference from the snapshot (e.g., '@e5', '@e12')"
+                },
+                "x": {
+                    "type": "number",
+                    "description": "Viewport X coordinate for compositor-level click. Use with y instead of ref to click through iframes, shadow DOM, or canvas elements."
+                },
+                "y": {
+                    "type": "number",
+                    "description": "Viewport Y coordinate for compositor-level click. Use with x instead of ref."
                 }
-            },
-            "required": ["ref"]
+            }
         }
     },
     {
@@ -1922,17 +1929,197 @@ def browser_snapshot(
         }, ensure_ascii=False)
 
 
-def browser_click(ref: str, task_id: Optional[str] = None) -> str:
+def _cdp_coordinate_click(
+    x: float,
+    y: float,
+    task_id: str,
+    button: str = "left",
+) -> str:
+    """Compositor-level click at viewport coordinates via CDP Input.dispatchMouseEvent.
+
+    This dispatches mouse events at the browser compositor level — Chrome does
+    its own hit-testing to route the event to the correct renderer process.
+    Works through iframes (same-origin and cross-origin OOPIFs), shadow DOM
+    (open and closed), canvas/WebGL elements, and overlays — anything visible
+    at those coordinates gets clicked.
+
+    Inspired by browser-harness's ``click_at_xy()`` strategy.
     """
-    Click on an element.
-    
+    try:
+        from tools.browser_cdp_tool import _cdp_call, _run_async, _resolve_cdp_endpoint, _WS_AVAILABLE
+    except ImportError:
+        return json.dumps({
+            "success": False,
+            "error": "browser_cdp_tool not available — coordinate clicks require the CDP tool module.",
+        }, ensure_ascii=False)
+
+    if not _WS_AVAILABLE:
+        return json.dumps({
+            "success": False,
+            "error": "The 'websockets' package is required for coordinate clicks. Install with: pip install websockets",
+        }, ensure_ascii=False)
+
+    endpoint = _resolve_cdp_endpoint()
+    if not endpoint:
+        # Fall back to agent-browser mouse commands (3 subprocess calls)
+        return _coordinate_click_via_agent_browser(x, y, task_id, button)
+
+    if not endpoint.startswith(("ws://", "wss://")):
+        return _coordinate_click_via_agent_browser(x, y, task_id, button)
+
+    # Find the page target to scope the input events to.
+    # Input.dispatchMouseEvent is a page-level method — we need a session.
+    try:
+        targets_result = _run_async(
+            _cdp_call(endpoint, "Target.getTargets", {}, None, 10.0)
+        )
+        page_target = None
+        for t in targets_result.get("targetInfos", []):
+            if t.get("type") == "page" and t.get("attached", True):
+                page_target = t["targetId"]
+                break
+        if not page_target:
+            # No attached page target — try without target_id
+            # (some CDP endpoints scope Input to the default page)
+            page_target = None
+    except Exception:
+        page_target = None
+
+    ix, iy = int(round(x)), int(round(y))
+
+    try:
+        # mousePressed
+        _run_async(_cdp_call(endpoint, "Input.dispatchMouseEvent", {
+            "type": "mousePressed",
+            "x": ix,
+            "y": iy,
+            "button": button,
+            "clickCount": 1,
+        }, page_target, 10.0))
+        # mouseReleased
+        _run_async(_cdp_call(endpoint, "Input.dispatchMouseEvent", {
+            "type": "mouseReleased",
+            "x": ix,
+            "y": iy,
+            "button": button,
+            "clickCount": 1,
+        }, page_target, 10.0))
+    except Exception as exc:
+        return json.dumps({
+            "success": False,
+            "error": f"CDP coordinate click failed: {type(exc).__name__}: {exc}",
+        }, ensure_ascii=False)
+
+    return json.dumps({
+        "success": True,
+        "clicked_at": {"x": ix, "y": iy},
+        "method": "cdp_compositor",
+    }, ensure_ascii=False)
+
+
+def _coordinate_click_via_agent_browser(
+    x: float,
+    y: float,
+    task_id: str,
+    button: str = "left",
+) -> str:
+    """Fallback: coordinate click via agent-browser mouse subcommands."""
+    effective_task_id = _last_session_key(task_id)
+    ix, iy = int(round(x)), int(round(y))
+
+    # agent-browser mouse move <x> <y> + mouse down + mouse up
+    move_result = _run_browser_command(effective_task_id, "mouse", ["move", str(ix), str(iy)])
+    if not move_result.get("success"):
+        return json.dumps({
+            "success": False,
+            "error": f"mouse move failed: {move_result.get('error', 'unknown')}",
+        }, ensure_ascii=False)
+
+    btn_arg = [] if button == "left" else [button]
+    down_result = _run_browser_command(effective_task_id, "mouse", ["down"] + btn_arg)
+    if not down_result.get("success"):
+        return json.dumps({
+            "success": False,
+            "error": f"mouse down failed: {down_result.get('error', 'unknown')}",
+        }, ensure_ascii=False)
+
+    up_result = _run_browser_command(effective_task_id, "mouse", ["up"] + btn_arg)
+    if not up_result.get("success"):
+        return json.dumps({
+            "success": False,
+            "error": f"mouse up failed: {up_result.get('error', 'unknown')}",
+        }, ensure_ascii=False)
+
+    return json.dumps({
+        "success": True,
+        "clicked_at": {"x": ix, "y": iy},
+        "method": "agent_browser_mouse",
+    }, ensure_ascii=False)
+
+
+def browser_click(
+    ref: Optional[str] = None,
+    x: Optional[float] = None,
+    y: Optional[float] = None,
+    task_id: Optional[str] = None,
+) -> str:
+    """
+    Click on an element by ref ID, or at exact viewport coordinates.
+
+    Provide EITHER ``ref`` (selector-based, via agent-browser) OR ``x`` + ``y``
+    (compositor-level, via CDP Input.dispatchMouseEvent).  Coordinate clicks
+    bypass DOM selectors entirely — they pass through iframes, shadow DOM,
+    cross-origin boundaries, and canvas elements.
+
     Args:
         ref: Element reference (e.g., "@e5")
+        x: Viewport X coordinate for compositor-level click
+        y: Viewport Y coordinate for compositor-level click
         task_id: Task identifier for session isolation
-        
+
     Returns:
         JSON string with click result
     """
+    # --- Input validation ---------------------------------------------------
+    has_ref = ref is not None and str(ref).strip() != ""
+    has_coords = x is not None and y is not None
+
+    if has_ref and has_coords:
+        return json.dumps({
+            "success": False,
+            "error": "Provide either 'ref' or 'x'+'y', not both.",
+        }, ensure_ascii=False)
+
+    if (x is not None) != (y is not None):
+        return json.dumps({
+            "success": False,
+            "error": "Both 'x' and 'y' are required for coordinate clicks.",
+        }, ensure_ascii=False)
+
+    if not has_ref and not has_coords:
+        return json.dumps({
+            "success": False,
+            "error": "Provide either 'ref' (element reference) or 'x'+'y' (viewport coordinates).",
+        }, ensure_ascii=False)
+
+    # --- Coordinate-based click (compositor-level) --------------------------
+    if has_coords:
+        try:
+            fx, fy = float(x), float(y)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return json.dumps({
+                "success": False,
+                "error": f"x and y must be numbers, got x={x!r} y={y!r}",
+            }, ensure_ascii=False)
+        return _cdp_coordinate_click(fx, fy, task_id or "default")
+
+    # --- Ref-based click (existing path) ------------------------------------
+    if not has_ref or ref is None:
+        # Defensive guard — validation above should ensure we never reach here
+        return json.dumps({
+            "success": False,
+            "error": "Internal error: expected ref parameter.",
+        }, ensure_ascii=False)
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_click
         return camofox_click(ref, task_id)
@@ -2928,7 +3115,7 @@ registry.register(
     name="browser_click",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_click"],
-    handler=lambda args, **kw: browser_click(ref=args.get("ref", ""), task_id=kw.get("task_id")),
+    handler=lambda args, **kw: browser_click(ref=args.get("ref"), x=args.get("x"), y=args.get("y"), task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
     emoji="👆",
 )
