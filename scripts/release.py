@@ -621,6 +621,8 @@ AUTHOR_MAP = {
     "2114364329@qq.com": "cuyua9",
     "2557058999@qq.com": "Disaster-Terminator",
     "cine.dreamer.one@gmail.com": "LeonSGP43",
+    "dodofun@126.com": "colorcross",
+    "1615063567@qq.com": "zhao0112",
     "leozeli@qq.com": "leozeli",
     "linlehao@cuhk.edu.cn": "LehaoLin",
     "liutong@isacas.ac.cn": "I3eg1nner",
