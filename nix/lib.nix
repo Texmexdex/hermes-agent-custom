@@ -160,32 +160,91 @@
       FIXED=0
       REPORT=""
 
+      # Normalize trailing newlines so a source-vs-cached lockfile diff is
+      # purely content-driven. Matches the patchPhase normalization in
+      # mkNpmPassthru, so this mirrors exactly what npmConfigHook sees.
+      _norm_lockfile() { sed -z 's/\n*$/\n/' "$1"; }
+
+      # Force a clean FOD rebuild to surface the real `got:` hash from the
+      # actual source lockfile, bypassing cachix pinning. Echoes the new
+      # hash on success; exits the loop entry with an error on failure.
+      # The NIX_FILE is always restored, even if the rebuild errors out.
+      _recompute_hash_from_wipe() {
+        local nix_file="$1" attr="$2"
+        local bak
+        bak="$(mktemp)"
+        cp "$nix_file" "$bak"
+        sed -i 's|hash = "sha256-[^"]*";|hash = "";|' "$nix_file"
+        local out rc
+        out=$(nix build ".#$attr.npmDeps" --no-link 2>&1) && rc=0 || rc=$?
+        cp "$bak" "$nix_file"
+        rm -f "$bak"
+        local new_hash
+        new_hash=$(echo "$out" | awk '/got:/ {print $2; exit}')
+        if [ -z "$new_hash" ]; then
+          echo "$out" | tail -20 >&2
+          return 1
+        fi
+        echo "$new_hash"
+      }
+
       for entry in "''${ENTRIES[@]}"; do
         IFS=":" read -r ATTR FOLDER NIX_FILE <<< "$entry"
         echo "==> .#$ATTR ($FOLDER -> $NIX_FILE)"
-        OUTPUT=$(nix build ".#$ATTR.npmDeps" --no-link --print-build-logs 2>&1)
-        STATUS=$?
-        if [ "$STATUS" -eq 0 ]; then
-          echo "    ok"
-          continue
-        fi
 
-        NEW_HASH=$(echo "$OUTPUT" | awk '/got:/ {print $2; exit}')
-        if [ -z "$NEW_HASH" ]; then
-          # Magic-Nix-Cache occasionally returns HTTP 418 / cache-throttled
-          # mid-run; nix then prints "outputs … not valid, so checking is
-          # not possible" without a `got:` line.  That's an infrastructure
-          # blip, not a stale lockfile — warn + skip rather than failing
-          # the lint.  A real hash mismatch would still surface in the
-          # primary `.#$ATTR` build, which is a separate CI job.
-          if echo "$OUTPUT" | grep -qE "throttled|HTTP error 418|substituter .* is disabled|some outputs of .* are not valid"; then
-            echo "    skipped (transient cache failure — see primary nix build for real status)" >&2
-            echo "$OUTPUT" | tail -8 >&2
+        # Build npmDeps (may resolve a cached FOD artifact pinned to a
+        # prior lockfile) and capture the resulting store path.
+        OUTPUT=$(nix build ".#$ATTR.npmDeps" --no-link --print-out-paths --print-build-logs 2>&1)
+        STATUS=$?
+
+        NEW_HASH=""
+
+        if [ "$STATUS" -eq 0 ]; then
+          # --print-out-paths emits the store path(s) on stdout (merged
+          # with build logs here). Last non-empty line is the npmDeps path.
+          OUT_PATH=$(echo "$OUTPUT" | awk 'NF' | tail -1)
+          SRC_LOCK="$FOLDER/package-lock.json"
+          CACHED_LOCK="$OUT_PATH/package-lock.json"
+          if [ ! -f "$CACHED_LOCK" ]; then
+            echo "    unexpected: $CACHED_LOCK missing from npmDeps output" >&2
+            echo "$OUTPUT" | tail -20 >&2
+            exit 1
+          fi
+          if diff -q <(_norm_lockfile "$SRC_LOCK") <(_norm_lockfile "$CACHED_LOCK") >/dev/null 2>&1; then
+            echo "    ok"
             continue
           fi
-          echo "    build failed with no hash mismatch:" >&2
-          echo "$OUTPUT" | tail -40 >&2
-          exit 1
+          # The pinned FOD hash resolves (cachix handed us a cached
+          # artifact), but the lockfile inside that artifact no longer
+          # matches the source lockfile. npmConfigHook in the real .#$ATTR
+          # build rejects this — so treat as stale and recompute the hash
+          # against the current source lockfile.
+          echo "    lockfile drift — source $SRC_LOCK differs from $CACHED_LOCK"
+          if ! NEW_HASH=$(_recompute_hash_from_wipe "$NIX_FILE" "$ATTR"); then
+            echo "    failed to recompute hash after wipe+rebuild" >&2
+            exit 1
+          fi
+        else
+          # npmDeps build failed outright (no cached artifact for the
+          # pinned hash; nix attempted to re-run fetchNpmDeps and reported
+          # a hash mismatch). Parse got: from the error.
+          NEW_HASH=$(echo "$OUTPUT" | awk '/got:/ {print $2; exit}')
+          if [ -z "$NEW_HASH" ]; then
+            # Magic-Nix-Cache occasionally returns HTTP 418 / cache-throttled
+            # mid-run; nix then prints "outputs … not valid, so checking is
+            # not possible" without a `got:` line.  That's an infrastructure
+            # blip, not a stale lockfile — warn + skip rather than failing
+            # the lint.  A real hash mismatch would still surface in the
+            # primary `.#$ATTR` build, which is a separate CI job.
+            if echo "$OUTPUT" | grep -qE "throttled|HTTP error 418|substituter .* is disabled|some outputs of .* are not valid"; then
+              echo "    skipped (transient cache failure — see primary nix build for real status)" >&2
+              echo "$OUTPUT" | tail -8 >&2
+              continue
+            fi
+            echo "    build failed with no hash mismatch:" >&2
+            echo "$OUTPUT" | tail -40 >&2
+            exit 1
+          fi
         fi
 
         HASH_LINE=$(grep -n 'hash = "sha256-' "$NIX_FILE" | head -1 | cut -d: -f1)
@@ -205,12 +264,16 @@
 
         if [ "$MODE" = "--apply" ]; then
           sed -i "s|hash = \"sha256-[^\"]*\";|hash = \"$NEW_HASH\";|" "$NIX_FILE"
-          if ! nix build ".#$ATTR.npmDeps" --no-link --print-build-logs; then
-            echo "    verification build failed after hash update" >&2
+          # Verify with the REAL package build (not just .npmDeps). This
+          # exercises npmConfigHook the same way CI does, so a "fixed" hash
+          # that would still break the downstream build gets caught here
+          # rather than after we push the fix.
+          if ! nix build ".#$ATTR" --no-link --print-build-logs; then
+            echo "    verification build of .#$ATTR failed after hash update" >&2
             exit 1
           fi
           FIXED=1
-          echo "    fixed"
+          echo "    fixed and verified"
         fi
       done
 
