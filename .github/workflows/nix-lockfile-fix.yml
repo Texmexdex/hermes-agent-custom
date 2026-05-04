@@ -26,27 +26,62 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # ── Auto-fix on main ───────────────────────────────────────────────
-  # Fires when a push to main touches package.json or package-lock.json
-  # in ui-tui/ or web/. Runs fix-lockfiles and pushes the hash
-  # update commit directly to main so Nix builds never stay broken.
+  # ── Check on main ──────────────────────────────────────────────────
+  # Fires on every push to main that touches a path-filtered file. Only
+  # runs fix-lockfiles --check and emits stale=true/false as a job output.
+  # NEVER cancels in-progress siblings: each push's detection signal must
+  # run to completion, otherwise a rapid-fire sequence of pushes can drop
+  # the only signal that ever existed for a given lockfile delta and
+  # leave main quietly broken.
+  check-main:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: nix-lockfile-check-main
+      cancel-in-progress: false
+    outputs:
+      stale: ${{ steps.check.outputs.stale }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          ref: main
+
+      - uses: ./.github/actions/nix-setup
+        with:
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Check lockfile hashes
+        id: check
+        # --check is non-fatal here: it sets $GITHUB_OUTPUT.stale and
+        # exits 1 when drift is found. We want stale=true/false to
+        # propagate to apply-main as a job output, not to fail this job.
+        run: nix run .#fix-lockfiles -- --check || true
+
+  # ── Apply on main ──────────────────────────────────────────────────
+  # Depends on check-main. Only runs when stale=true, so the cheap
+  # detection path isn't gated behind the expensive apply path.
+  # DOES cancel in-progress siblings: we only want the newest push's
+  # fix to actually land on main — older in-flight applies are
+  # computing against outdated state and would race the push anyway.
   #
   # Safety invariants:
   #   1. The fix commit only touches nix/*.nix files, which are NOT in
   #      the paths filter above, so this cannot re-trigger itself.
   #   2. An explicit file-whitelist check before commit aborts if
   #      fix-lockfiles ever modifies unexpected files.
-  #   3. Job-level concurrency with cancel-in-progress: true ensures
-  #      back-to-back pushes collapse to the newest; ref: main checkout
-  #      always operates on the latest branch state.
-  #   4. Uses a GitHub App token (not GITHUB_TOKEN) so the fix commit
+  #   3. Uses a GitHub App token (not GITHUB_TOKEN) so the fix commit
   #      triggers downstream nix.yml verification.
-  auto-fix-main:
-    if: github.event_name == 'push'
+  #   4. Rebase-retry-on-push handles the case where main advanced
+  #      with an unrelated commit during the nix build; aborts
+  #      cleanly if package files changed since hash computation.
+  apply-main:
+    needs: check-main
+    if: needs.check-main.outputs.stale == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     concurrency:
-      group: auto-fix-main
+      group: nix-lockfile-apply-main
       cancel-in-progress: true
     steps:
       - name: Generate GitHub App token
