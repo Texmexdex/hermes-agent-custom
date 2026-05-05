@@ -119,7 +119,7 @@ def _load_web_config() -> dict:
         return {}
 
 def _get_backend() -> str:
-    """Determine which web backend to use.
+    """Determine which web backend to use (shared fallback).
 
     Reads ``web.backend`` from config.yaml (set by ``hermes tools``).
     Falls back to whichever API key is present for users who configured
@@ -143,6 +143,41 @@ def _get_backend() -> str:
             return backend
 
     return "firecrawl"  # default (backward compat)
+
+
+def _get_search_backend() -> str:
+    """Determine which backend to use for web_search specifically.
+
+    Selection priority:
+    1. ``web.search_backend`` (per-capability override)
+    2. ``web.backend`` (shared fallback — existing behavior)
+    3. Auto-detect from env vars
+
+    This enables using different providers for search vs extract
+    (e.g. SearXNG for search + Firecrawl for extract).
+    """
+    cfg = _load_web_config()
+    # Per-capability override takes priority
+    search_specific = (cfg.get("search_backend") or "").lower().strip()
+    if search_specific and _is_backend_available(search_specific):
+        return search_specific
+    # Fall through to shared backend selection
+    return _get_backend()
+
+
+def _get_extract_backend() -> str:
+    """Determine which backend to use for web_extract specifically.
+
+    Selection priority:
+    1. ``web.extract_backend`` (per-capability override)
+    2. ``web.backend`` (shared fallback — existing behavior)
+    3. Auto-detect from env vars
+    """
+    cfg = _load_web_config()
+    extract_specific = (cfg.get("extract_backend") or "").lower().strip()
+    if extract_specific and _is_backend_available(extract_specific):
+        return extract_specific
+    return _get_backend()
 
 
 def _is_backend_available(backend: str) -> bool:
@@ -1127,8 +1162,8 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         if is_interrupted():
             return tool_error("Interrupted", success=False)
 
-        # Dispatch to the configured backend
-        backend = _get_backend()
+        # Dispatch to the configured search backend
+        backend = _get_search_backend()
         if backend == "parallel":
             response_data = _parallel_search(query, limit)
             debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
@@ -1284,7 +1319,7 @@ async def web_extract_tool(
         if not safe_urls:
             results = []
         else:
-            backend = _get_backend()
+            backend = _get_extract_backend()
 
             if backend == "parallel":
                 results = await _parallel_extract(safe_urls)
