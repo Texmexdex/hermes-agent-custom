@@ -25,7 +25,7 @@ import "@xterm/xterm/css/xterm.css";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { Typography } from "@/components/NouiTypography";
 import { cn } from "@/lib/utils";
-import { Copy, PanelRight, X } from "lucide-react";
+import { Copy, ListOrdered, PanelRight, SquareTerminal, StopCircle, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useSearchParams } from "react-router-dom";
@@ -107,6 +107,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  const [inputValue, setInputValue] = useState("");
   // Exposed to the main metrics-sync effect so it can refit the terminal
   // the moment `isActive` flips back to true (display:none → display:flex
   // collapses the host's box, so ResizeObserver never fires on return).
@@ -232,6 +234,136 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     termRef.current?.focus();
   };
 
+  const handleSend = () => {
+    const ws = wsRef.current;
+    const text = inputValue;
+    if (!ws || ws.readyState !== WebSocket.OPEN || !text.trim()) return;
+    // Send the text as a single burst so it arrives as one stdin read,
+    // then send Enter after a short delay so the tokenizer sees it as a
+    // separate keypress.  Without the delay the text and \r can coalesce
+    // into one token (e.g. "hello\r") which parseKeypress does not
+    // recognise as Return — the \r is only matched when it arrives alone.
+    ws.send(text);
+    setTimeout(() => {
+      const s = wsRef.current;
+      if (s && s.readyState === WebSocket.OPEN) s.send("\r");
+    }, 100);
+    setInputValue("");
+  };
+
+  const handleInputKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      handleSend();
+    }
+  };
+
+  // -- Toolbar: send raw bytes to the PTY via the existing WebSocket -------
+  const sendRaw = useCallback(
+    (bytes: Uint8Array | string) => {
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      if (typeof bytes === "string") {
+        const buf = new Uint8Array(bytes.length);
+        for (let i = 0; i < bytes.length; i++) buf[i] = bytes.charCodeAt(i);
+        ws.send(buf);
+      } else {
+        ws.send(bytes);
+      }
+    },
+    [],
+  );
+
+  // Scroll: synthesize SGR mouse wheel events at the viewport center so Ink
+  // (the TUI) processes them as real scroll input.  Using scrollLines() only
+  // moves xterm.js's viewport without notifying the PTY — Ink never learns.
+  const sendWheel = useCallback(
+    (direction: 1 | -1) => {
+      const term = termRef.current;
+      const ws = wsRef.current;
+      if (!term || !ws || ws.readyState !== WebSocket.OPEN) return;
+      // SGR mouse wheel: ESC [ < button ; col ; row M
+      // button 0x40 = wheel-up, 0x41 = wheel-down (base 64 + 0/1)
+      const cb = 0x40 | (direction === -1 ? 0 : 1);
+      const col = Math.round(term.cols / 2);
+      const row = Math.round(term.rows / 2);
+      const seq = `\x1b[<${cb};${col};${row}M`;
+      const buf = new Uint8Array(seq.length);
+      for (let i = 0; i < seq.length; i++) buf[i] = seq.charCodeAt(i);
+      ws.send(buf);
+    },
+    [],
+  );
+  const handleCancel = useCallback(() => {
+    sendRaw(new Uint8Array([0x03]));
+    termRef.current?.focus();
+  }, [sendRaw]);
+
+  // Queue-mode cycle: interrupt → queue → steer → interrupt.
+  // Sends a /config set slash command so the TUI picks it up.
+  const BUSY_MODES = ["interrupt", "queue", "steer"] as const;
+  const [busyMode, setBusyMode] = useState<string>("interrupt");
+  const handleToggleBusyMode = useCallback(() => {
+    const next =
+      BUSY_MODES[(BUSY_MODES.indexOf(busyMode as (typeof BUSY_MODES)[number]) + 1) % BUSY_MODES.length];
+    setBusyMode(next);
+    sendRaw(`/config set display.busy_input_mode ${next}`);
+    setTimeout(() => {
+      const s = wsRef.current;
+      if (s && s.readyState === WebSocket.OPEN) s.send(new Uint8Array([0x0d]));
+    }, 100);
+    termRef.current?.focus();
+  }, [busyMode, sendRaw]);
+
+  // Slash command popover
+  const [slashOpen, setSlashOpen] = useState(false);
+  const slashAnchorRef = useRef<HTMLButtonElement | null>(null);
+  const slashPopRef = useRef<HTMLDivElement | null>(null);
+
+  const SLASH_COMMANDS: { label: string; cmd: string; desc: string }[] = [
+    { label: "/queue", cmd: "/queue", desc: "View queued messages" },
+    { label: "/cancel", cmd: "/cancel", desc: "Cancel current run" },
+    { label: "/new", cmd: "/new", desc: "Start a new session" },
+    { label: "/sessions", cmd: "/sessions", desc: "List sessions" },
+    { label: "/model", cmd: "/model", desc: "Switch model" },
+    { label: "/resume", cmd: "/resume", desc: "Resume a session" },
+    { label: "/copy", cmd: "/copy", desc: "Copy last response" },
+    { label: "/help", cmd: "/help", desc: "Show all commands" },
+    { label: "/clear", cmd: "/clear", desc: "Clear the screen" },
+  ];
+
+  const handleSlashSelect = useCallback(
+    (cmd: string) => {
+      setSlashOpen(false);
+      sendRaw(cmd);
+      setTimeout(() => {
+        const s = wsRef.current;
+        if (s && s.readyState === WebSocket.OPEN) s.send(new Uint8Array([0x0d]));
+      }, 100);
+      termRef.current?.focus();
+    },
+    [sendRaw],
+  );
+
+  // Close slash popover on outside click
+  useEffect(() => {
+    if (!slashOpen) return;
+    const handler = (e: MouseEvent) => {
+      const pop = slashPopRef.current;
+      const btn = slashAnchorRef.current;
+      if (
+        pop &&
+        btn &&
+        !pop.contains(e.target as Node) &&
+        !btn.contains(e.target as Node)
+      ) {
+        setSlashOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [slashOpen]);
+
   useEffect(() => {
     const host = hostRef.current;
     if (!host) return;
@@ -246,6 +378,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     const term = new Terminal({
       allowProposedApi: true,
       cursorBlink: true,
+      disableStdin: true,
       fontFamily:
         "'JetBrains Mono', 'Cascadia Mono', 'Fira Code', 'MesloLGS NF', 'Source Code Pro', Menlo, Consolas, 'DejaVu Sans Mono', monospace",
       fontSize: terminalFontSizeForWidth(tierW0),
@@ -254,7 +387,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       fontWeight: "400",
       fontWeightBold: "700",
       macOptionIsMeta: true,
-      scrollback: 0,
+      scrollback: 10000,
       theme: TERMINAL_THEME,
     });
     termRef.current = term;
@@ -504,6 +637,9 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
 
     ws.onmessage = (ev) => {
       if (typeof ev.data === "string") {
+        // Server only sends binary frames; a text frame means something
+        // unexpected (e.g. an error message).  Write it as-is so the user
+        // sees it rather than silently dropping.
         term.write(ev.data);
       } else {
         term.write(new Uint8Array(ev.data as ArrayBuffer));
@@ -548,6 +684,39 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     const SGR_MOUSE_RE = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/;
     let lastMotionCell = { col: -1, row: -1 };
     let lastMotionCb = -1;
+
+    // Selection-mode tracking: when the user is dragging to select text in the
+    // terminal, we must NOT forward mouse events to the TUI (Ink).  Ink
+    // interprets mouse reports as hover/click on its interactive widgets and
+    // will steal focus, clear the selection, or trigger side-effects.
+    // We detect selection by watching for a mouse-down → drag → mouse-up
+    // sequence on the host element.  While selecting, only wheel events are
+    // forwarded (so the user can still scroll during a selection).
+    let selecting = false;
+    let mouseDownOnHost = false;
+    const onHostMouseDown = (e: MouseEvent) => {
+      // Only left button, no modifiers → likely a selection drag
+      if (e.button === 0 && !e.ctrlKey && !e.shiftKey && !e.metaKey && !e.altKey) {
+        mouseDownOnHost = true;
+        selecting = false; // will become true on first drag
+      }
+    };
+    const onHostMouseMove = () => {
+      if (mouseDownOnHost) selecting = true;
+    };
+    const onHostMouseUp = () => {
+      // If mouse went down and up without significant movement, it was a
+      // click (not a drag-select) — keep selecting=false so the click
+      // forwards normally.
+      mouseDownOnHost = false;
+      // Delay clearing so the onData handler sees selecting=true for any
+      // trailing mouse-up event from xterm.
+      setTimeout(() => { selecting = false; }, 50);
+    };
+    host.addEventListener("mousedown", onHostMouseDown);
+    host.addEventListener("mousemove", onHostMouseMove);
+    host.addEventListener("mouseup", onHostMouseUp);
+
     const onDataDisposable = term.onData((data) => {
       if (ws.readyState !== WebSocket.OPEN) return;
 
@@ -561,6 +730,16 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         // Wheel events have bit 0x40 (64); always forward wheel.
         const isMotion = (cb & 0x20) !== 0 && (cb & 0x40) === 0;
         const isWheel = (cb & 0x40) !== 0;
+
+        // During text selection, suppress all mouse reports except wheel.
+        // This prevents Ink from reacting to hover/click during drag-select.
+        if (selecting && !isWheel) {
+          // Reset dedup state so the next post-selection event isn't dropped
+          lastMotionCell = { col: -1, row: -1 };
+          lastMotionCb = -1;
+          return;
+        }
+
         if (isMotion && !isWheel && !released) {
           if (
             col === lastMotionCell.col &&
@@ -579,7 +758,15 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         }
       }
 
-      ws.send(data);
+      // Send as binary (Uint8Array) instead of a JS string so that
+      // multi-byte UTF-8 characters and raw control bytes arrive at the
+      // server without a text-encoding round-trip that can split or
+      // corrupt partial sequences across WebSocket frames.
+      const buf = new Uint8Array(data.length);
+      for (let i = 0; i < data.length; i++) {
+        buf[i] = data.charCodeAt(i);
+      }
+      ws.send(buf);
     });
 
     const onResizeDisposable = term.onResize(({ cols, rows }) => {
@@ -588,10 +775,14 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       }
     });
 
-    term.focus();
+    // Note: we do NOT call term.focus() here — the terminal is display-only.
+    // User input goes through the separate input box below.
 
     return () => {
       unmounting = true;
+      host.removeEventListener("mousedown", onHostMouseDown);
+      host.removeEventListener("mousemove", onHostMouseMove);
+      host.removeEventListener("mouseup", onHostMouseUp);
       syncMetricsRef.current = null;
       onDataDisposable.dispose();
       onResizeDisposable.dispose();
@@ -656,7 +847,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           host !== null &&
           !host.contains(active);
         if (!focusIsElsewhereInChatPage) {
-          termRef.current?.focus();
+          inputRef.current?.focus();
         }
       });
     });
@@ -769,44 +960,310 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       )}
 
       <div className="flex min-h-0 flex-1 flex-col gap-2 lg:flex-row lg:gap-3">
-        <div
-          className={cn(
-            "relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-lg",
-            "p-2 sm:p-3",
-          )}
-          style={{
-            backgroundColor: TERMINAL_THEME.background,
-            boxShadow: "0 8px 32px rgba(0, 0, 0, 0.4)",
-          }}
-        >
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-2">
           <div
-            ref={hostRef}
-            className="hermes-chat-xterm-host min-h-0 min-w-0 flex-1"
-          />
-
-          <Button
-            ghost
-            onClick={handleCopyLast}
-            title="Copy last assistant response as raw markdown"
-            aria-label="Copy last assistant response"
             className={cn(
-              "absolute z-10",
-              "rounded border border-current/30",
-              "bg-black/20 backdrop-blur-sm",
-              "opacity-60 hover:opacity-100 hover:border-current/60",
-              "transition-opacity duration-150 normal-case font-normal tracking-normal",
-              "bottom-2 right-2 px-2 py-1 text-[0.65rem] sm:bottom-3 sm:right-3 sm:px-2.5 sm:py-1.5 sm:text-xs",
-              "lg:bottom-4 lg:right-4",
+              "relative flex min-h-0 min-w-0 flex-1 overflow-hidden rounded-lg",
+              "p-2 sm:p-3",
             )}
-            style={{ color: TERMINAL_THEME.foreground }}
+            style={{
+              backgroundColor: TERMINAL_THEME.background,
+              boxShadow: "0 8px 32px rgba(0, 0, 0, 0.4)",
+            }}
           >
-            <span className="inline-flex items-center gap-1.5">
-              <Copy className="h-3 w-3 shrink-0" />
-              <span className="hidden min-[400px]:inline tracking-wide">
-                {copyState === "copied" ? "copied" : "copy last response"}
+            <div
+              ref={hostRef}
+              className="hermes-chat-xterm-host min-h-0 min-w-0 flex-1"
+              onContextMenu={(e) => e.preventDefault()}
+              style={{ userSelect: "text" }}
+            />
+
+            <Button
+              ghost
+              onClick={handleCopyLast}
+              title="Copy last assistant response as raw markdown"
+              aria-label="Copy last assistant response"
+              className={cn(
+                "absolute z-10",
+                "rounded border border-current/30",
+                "bg-black/20 backdrop-blur-sm",
+                "opacity-60 hover:opacity-100 hover:border-current/60",
+                "transition-opacity duration-150 normal-case font-normal tracking-normal",
+                "bottom-2 right-2 px-2 py-1 text-[0.65rem] sm:bottom-3 sm:right-3 sm:px-2.5 sm:py-1.5 sm:text-xs",
+                "lg:bottom-4 lg:right-4",
+              )}
+              style={{ color: TERMINAL_THEME.foreground }}
+            >
+              <span className="inline-flex items-center gap-1.5">
+                <Copy className="h-3 w-3 shrink-0" />
+                <span className="hidden min-[400px]:inline tracking-wide">
+                  {copyState === "copied" ? "copied" : "copy last response"}
+                </span>
               </span>
-            </span>
-          </Button>
+            </Button>
+          </div>
+
+          {/* Toolbar: Cancel, nav keys, scroll, queue mode, slash commands */}
+          <div
+            className={cn(
+              "flex flex-wrap items-center gap-1 rounded-lg px-2 py-1.5",
+              "border border-current/20",
+            )}
+            style={{ backgroundColor: TERMINAL_THEME.background }}
+          >
+            {/* Cancel / Interrupt */}
+            <button
+              onClick={handleCancel}
+              title="Cancel current run (Ctrl+C)"
+              aria-label="Cancel current run"
+              className={cn(
+                "inline-flex items-center gap-1 rounded px-2 py-1 text-[0.65rem] font-medium",
+                "border border-current/20 text-midground/70",
+                "hover:text-red-400 hover:border-red-400/40 hover:bg-red-400/10",
+                "transition-colors duration-150",
+              )}
+            >
+              <StopCircle className="h-3 w-3 shrink-0" />
+              <span className="hidden min-[400px]:inline tracking-wide">Cancel</span>
+            </button>
+
+            {/* Nav cluster: Arrow Up, Down, Left, Right, Enter, Esc */}
+            <div className="flex items-center gap-0.5 border-l border-current/10 pl-1 ml-0.5">
+              {([
+                { code: "\x1b[A", label: "↑", title: "Arrow Up" },
+                { code: "\x1b[B", label: "↓", title: "Arrow Down" },
+                { code: "\x1b[D", label: "←", title: "Arrow Left" },
+                { code: "\x1b[C", label: "→", title: "Arrow Right" },
+              ] as const).map(({ code, label, title }) => (
+                <button
+                  key={code}
+                  onClick={() => sendRaw(code)}
+                  title={title}
+                  aria-label={title}
+                  className={cn(
+                    "rounded px-1.5 py-1 text-[0.6rem] font-mono font-medium leading-none",
+                    "text-midground/60 hover:text-midground hover:bg-midground/10",
+                    "transition-colors duration-100",
+                  )}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+
+            <div className="flex items-center gap-0.5 border-l border-current/10 pl-1 ml-0.5">
+              <button
+                onClick={() => sendRaw("\r")}
+                title="Enter / Select"
+                aria-label="Enter"
+                className={cn(
+                  "rounded px-2 py-1 text-[0.6rem] font-medium leading-none",
+                  "text-midground/60 hover:text-midground hover:bg-midground/10",
+                  "transition-colors duration-100",
+                )}
+              >
+                Enter
+              </button>
+              <button
+                onClick={() => sendRaw("\x1b")}
+                title="Escape / Back"
+                aria-label="Escape"
+                className={cn(
+                  "rounded px-2 py-1 text-[0.6rem] font-medium leading-none",
+                  "text-midground/60 hover:text-midground hover:bg-midground/10",
+                  "transition-colors duration-100",
+                )}
+              >
+                Esc
+              </button>
+            </div>
+
+            {/* Scroll cluster */}
+            <div className="flex items-center gap-0.5 border-l border-current/10 pl-1 ml-0.5">
+              <button
+                onClick={() => sendWheel(-1)}
+                title="Scroll Up"
+                aria-label="Scroll Up"
+                className={cn(
+                  "rounded px-1.5 py-1 text-[0.6rem] font-mono font-medium leading-none",
+                  "text-midground/60 hover:text-midground hover:bg-midground/10",
+                  "transition-colors duration-100",
+                )}
+              >
+                ⇡
+              </button>
+              <button
+                onClick={() => sendWheel(1)}
+                title="Scroll Down"
+                aria-label="Scroll Down"
+                className={cn(
+                  "rounded px-1.5 py-1 text-[0.6rem] font-mono font-medium leading-none",
+                  "text-midground/60 hover:text-midground hover:bg-midground/10",
+                  "transition-colors duration-100",
+                )}
+              >
+                ⇣
+              </button>
+            </div>
+
+            {/* Approve / Reject (Y/N) */}
+            <div className="flex items-center gap-0.5 border-l border-current/10 pl-1 ml-0.5">
+              <button
+                onClick={() => {
+                  sendRaw("y");
+                  setTimeout(() => {
+                    const s = wsRef.current;
+                    if (s && s.readyState === WebSocket.OPEN) s.send(new Uint8Array([0x0d]));
+                  }, 80);
+                }}
+                title="Approve / Yes"
+                aria-label="Approve"
+                className={cn(
+                  "rounded px-2 py-1 text-[0.6rem] font-medium leading-none",
+                  "text-green-500/70 hover:text-green-400 hover:bg-green-400/10",
+                  "transition-colors duration-100",
+                )}
+              >
+                ✓ Yes
+              </button>
+              <button
+                onClick={() => {
+                  sendRaw("n");
+                  setTimeout(() => {
+                    const s = wsRef.current;
+                    if (s && s.readyState === WebSocket.OPEN) s.send(new Uint8Array([0x0d]));
+                  }, 80);
+                }}
+                title="Reject / No"
+                aria-label="Reject"
+                className={cn(
+                  "rounded px-2 py-1 text-[0.6rem] font-medium leading-none",
+                  "text-red-500/70 hover:text-red-400 hover:bg-red-400/10",
+                  "transition-colors duration-100",
+                )}
+              >
+                ✗ No
+              </button>
+            </div>
+
+            {/* Spacer */}
+            <div className="flex-1 min-w-2" />
+
+            {/* Queue-mode toggle */}
+            <button
+              onClick={handleToggleBusyMode}
+              title={`Input while busy: ${busyMode} (click to cycle)`}
+              aria-label={`Input while busy: ${busyMode}`}
+              className={cn(
+                "inline-flex items-center gap-1 rounded px-2 py-1 text-[0.65rem] font-medium",
+                "border border-current/20",
+                busyMode === "interrupt" && "text-midground/70 hover:text-amber-400 hover:border-amber-400/40 hover:bg-amber-400/10",
+                busyMode === "queue" && "text-blue-400/80 border-blue-400/30 bg-blue-400/5 hover:text-blue-300 hover:border-blue-400/50",
+                busyMode === "steer" && "text-purple-400/80 border-purple-400/30 bg-purple-400/5 hover:text-purple-300 hover:border-purple-400/50",
+                "transition-colors duration-150",
+              )}
+            >
+              <ListOrdered className="h-3 w-3 shrink-0" />
+              <span className="hidden min-[400px]:inline tracking-wide">{busyMode}</span>
+            </button>
+
+            {/* Slash commands popover anchor */}
+            <div className="relative">
+              <button
+                ref={slashAnchorRef}
+                onClick={() => setSlashOpen((o) => !o)}
+                title="Slash commands"
+                aria-label="Slash commands"
+                aria-expanded={slashOpen}
+                className={cn(
+                  "inline-flex items-center gap-1 rounded px-2 py-1 text-[0.65rem] font-medium",
+                  "border border-current/20 text-midground/70",
+                  "hover:text-midground hover:border-current/40",
+                  slashOpen && "text-midground border-current/40 bg-midground/5",
+                  "transition-colors duration-150",
+                )}
+              >
+                <SquareTerminal className="h-3 w-3 shrink-0" />
+                <span className="hidden min-[400px]:inline tracking-wide">/</span>
+              </button>
+
+              {slashOpen && (
+                <div
+                  ref={slashPopRef}
+                  role="listbox"
+                  aria-label="Slash commands"
+                  className={cn(
+                    "absolute bottom-full right-0 mb-2 w-64 max-h-72 overflow-y-auto",
+                    "rounded-lg border border-current/20 shadow-xl",
+                    "bg-background-base/95 backdrop-blur-sm",
+                    "py-1 z-50",
+                  )}
+                  style={{ backgroundColor: TERMINAL_THEME.background }}
+                >
+                  <div className="px-3 py-1.5 text-[0.6rem] font-semibold uppercase tracking-widest text-current/30">
+                    Commands
+                  </div>
+                  {SLASH_COMMANDS.map((item) => (
+                    <button
+                      key={item.cmd}
+                      role="option"
+                      onClick={() => handleSlashSelect(item.cmd)}
+                      className={cn(
+                        "flex w-full items-center gap-2 px-3 py-1.5 text-left",
+                        "text-[0.7rem] transition-colors duration-100",
+                        "hover:bg-midground/10 text-midground/80 hover:text-midground",
+                      )}
+                    >
+                      <span className="font-mono font-medium shrink-0">{item.label}</span>
+                      <span className="text-current/40 truncate">{item.desc}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Decoupled text input — only this box accepts keyboard input.
+              Text is sent cleanly to the PTY on Enter, bypassing xterm.js
+              entirely so no escape sequences or terminal artifacts can bleed
+              into the input area. */}
+          <div
+            className={cn(
+              "flex items-center gap-2 rounded-lg px-3 py-2",
+              "border border-current/20",
+            )}
+            style={{ backgroundColor: TERMINAL_THEME.background }}
+          >
+            <input
+              ref={inputRef}
+              type="text"
+              value={inputValue}
+              onChange={(e) => setInputValue(e.target.value)}
+              onKeyDown={handleInputKeyDown}
+              placeholder="Type a message…"
+              className={cn(
+                "min-w-0 flex-1 bg-transparent text-sm outline-none",
+                "placeholder:text-current/30",
+              )}
+              style={{ color: TERMINAL_THEME.foreground }}
+              autoComplete="off"
+              spellCheck={false}
+            />
+            <button
+              onClick={handleSend}
+              disabled={!inputValue.trim()}
+              className={cn(
+                "shrink-0 rounded px-2.5 py-1 text-xs font-medium",
+                "border border-current/20",
+                "transition-colors duration-150",
+                inputValue.trim()
+                  ? "text-midground/80 hover:text-midground hover:bg-midground/10"
+                  : "text-current/15 cursor-not-allowed",
+              )}
+            >
+              Send
+            </button>
+          </div>
         </div>
 
         {!narrow && (

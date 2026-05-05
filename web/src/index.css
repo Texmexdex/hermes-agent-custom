@@ -227,3 +227,21 @@ code { font-size: 0.875rem; }
   display: none;
 }
 
+/* ------------------------------------------------------------------ */
+/* Chat tab — xterm display-only mode                                  */
+/*                                                                    */
+/* With disableStdin: true, xterm.js still creates an internal        */
+/* <textarea> inside the host div for IME composition. That textarea  */
+/* can steal focus and cause escape sequences / garbage to bleed into  */
+/* the browser input area. We hide it completely — all keyboard input  */
+/* goes through the decoupled <input> box below the terminal.          */
+/* ------------------------------------------------------------------ */
+.hermes-chat-xterm-host .xterm textarea {
+  pointer-events: none !important;
+  opacity: 0 !important;
+  position: absolute !important;
+  width: 0 !important;
+  height: 0 !important;
+  overflow: hidden !important;
+}
+
